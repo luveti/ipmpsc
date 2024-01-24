@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(
             Arg::with_name("zero copy")
                 .long("zero-copy")
-                .help("Use zero-copy deserialization"),
+                .help("Use zero-copy decoding"),
         )
         .get_matches();
 

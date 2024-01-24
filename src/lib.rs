@@ -1,15 +1,15 @@
 //! Inter-Process Multiple Producer, Single Consumer Channels for Rust
 //!
 //! This library provides a type-safe, high-performance inter-process channel implementation based on a shared
-//! memory ring buffer.  It uses [bincode](https://github.com/TyOverby/bincode) for (de)serialization, including
-//! zero-copy deserialization, making it ideal for messages with large `&str` or `&[u8]` fields.  And it has a name
+//! memory ring buffer.  It uses [bincode](https://github.com/TyOverby/bincode) for encoding/decoding, including
+//! zero-copy decoding, making it ideal for messages with large `&str` or `&[u8]` fields.  And it has a name
 //! that rolls right off the tongue.
 
 #![deny(warnings)]
 
+use bincode::{config::{Configuration, LittleEndian, Fixint, NoLimit}, Decode, Encode};
 use memmap2::MmapMut;
 use os::{Buffer, Header, View};
-use serde::{Deserialize, Serialize};
 use std::{
     cell::UnsafeCell,
     ffi::c_void,
@@ -23,6 +23,8 @@ use std::{
 };
 use tempfile::NamedTempFile;
 use thiserror::Error as ThisError;
+
+const BINCODE_CONFIG: Configuration<LittleEndian, Fixint, NoLimit> = bincode::config::legacy();
 
 #[cfg(unix)]
 mod posix;
@@ -54,6 +56,14 @@ const BEGINNING: u32 = mem::size_of::<Header>() as u32;
 /// If set, indicates the ring buffer was created by a 64-bit process (32-bit otherwise)
 const FLAG_64_BIT: u32 = 1;
 
+#[derive(ThisError, Debug)]
+pub enum BincodeError {
+    #[error(transparent)]
+    Decode(#[from] bincode::error::DecodeError),
+    #[error(transparent)]
+    Encode(#[from] bincode::error::EncodeError),
+}
+
 /// `ipmpsc`-specific error type
 #[derive(ThisError, Debug)]
 pub enum Error {
@@ -62,14 +72,14 @@ pub enum Error {
     #[error("A ZeroCopyContext may only be used to receive one message")]
     AlreadyReceived,
 
-    /// Error indicating that the caller attempted to send a message of zero serialized size, which is not
+    /// Error indicating that the caller attempted to send a message of zero encoded size, which is not
     /// supported.
-    #[error("Serialized size of message is zero")]
+    #[error("Encoded size of message is zero")]
     ZeroSizedMessage,
 
-    /// Error indicating that the caller attempted to send a message of serialized size greater than the ring
+    /// Error indicating that the caller attempted to send a message of encoded size greater than the ring
     /// buffer capacity.
-    #[error("Serialized size of message is too large for ring buffer")]
+    #[error("Encoded size of message is too large for ring buffer")]
     MessageTooLarge,
 
     /// Error indicating the the maximum number of simultaneous senders has been exceeded.
@@ -89,9 +99,9 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// Wrapped bincode error encountered during (de)serialization.
+    /// Wrapped bincode error encountered during encoding/decoding.
     #[error(transparent)]
-    Bincode(#[from] bincode::Error),
+    Bincode(#[from] BincodeError),
 }
 
 /// `ipmpsc`-specific Result type alias
@@ -202,7 +212,6 @@ impl SharedRingBuffer {
 }
 
 /// Represents the receiving end of an inter-process channel, capable of receiving any message type implementing
-/// [`serde::Deserialize`](https://docs.serde.rs/serde/trait.Deserialize.html).
 pub struct Receiver(SharedRingBuffer);
 
 impl Receiver {
@@ -222,10 +231,7 @@ impl Receiver {
     /// Attempt to read a message without blocking.
     ///
     /// This will return `Ok(None)` if there are no messages immediately available.
-    pub fn try_recv<T>(&self) -> Result<Option<T>>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
+    pub fn try_recv<T: Decode>(&self) -> Result<Option<T>> {
         Ok(if let Some((value, position)) = self.try_recv_0()? {
             self.seek(position)?;
 
@@ -235,7 +241,7 @@ impl Receiver {
         })
     }
 
-    fn try_recv_0<'a, T: Deserialize<'a>>(&'a self) -> Result<Option<(T, u32)>> {
+    fn try_recv_0<T: Decode>(&self) -> Result<Option<(T, u32)>> {
         let buffer = self.0 .0.buffer();
         let map = buffer.map();
 
@@ -246,13 +252,13 @@ impl Receiver {
             if write != read {
                 let slice = map.as_ref();
                 let start = read + 4;
-                let size = bincode::deserialize::<u32>(&slice[read as usize..start as usize])?;
+                let (size, _) = bincode::decode_from_slice::<u32, _>(&slice[read as usize..start as usize], BINCODE_CONFIG)
+                    .map_err(|e| Error::Bincode(BincodeError::Decode(e)))?;
                 if size > 0 {
                     let end = start + size;
-                    break Some((
-                        bincode::deserialize(&slice[start as usize..end as usize])?,
-                        end,
-                    ));
+                    let (value, _) = bincode::decode_from_slice::<T, _>(&slice[start as usize..end as usize], BINCODE_CONFIG)
+                        .map_err(|e| Error::Bincode(BincodeError::Decode(e)))?;
+                    break Some((value, end));
                 } else if write < read {
                     read = BEGINNING;
                     let mut lock = buffer.lock()?;
@@ -268,10 +274,7 @@ impl Receiver {
     }
 
     /// Attempt to read a message, blocking if necessary until one becomes available.
-    pub fn recv<T>(&self) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
+    pub fn recv<T: Decode>(&self) -> Result<T> {
         let (value, position) = self.recv_timeout_0(None)?.unwrap();
 
         self.seek(position)?;
@@ -281,10 +284,7 @@ impl Receiver {
 
     /// Attempt to read a message, blocking for up to the specified duration if necessary until one becomes
     /// available.
-    pub fn recv_timeout<T>(&self, timeout: Duration) -> Result<Option<T>>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
+    pub fn recv_timeout<T: Decode>(&self, timeout: Duration) -> Result<Option<T>> {
         Ok(
             if let Some((value, position)) = self.recv_timeout_0(Some(timeout))? {
                 self.seek(position)?;
@@ -296,7 +296,7 @@ impl Receiver {
         )
     }
 
-    /// Borrows this receiver for deserializing a message with references that refer directly to this
+    /// Borrows this receiver for decoding a message with references that refer directly to this
     /// [`Receiver`](struct.Receiver.html)'s ring buffer rather than copying out of it.
     ///
     /// Because those references refer directly to the ring buffer, the read pointer cannot be advanced until the
@@ -307,10 +307,10 @@ impl Receiver {
     /// 1. The underlying [`Receiver`](struct.Receiver.html) cannot be used while a
     /// [`ZeroCopyContext`](struct.ZeroCopyContext.html) borrows it (enforced at compile time).
     ///
-    /// 2. References in a message deserialized using a given [`ZeroCopyContext`](struct.ZeroCopyContext.html)
+    /// 2. References in a message decoded using a given [`ZeroCopyContext`](struct.ZeroCopyContext.html)
     /// cannot outlive that instance (enforced at compile time).
     ///
-    /// 3. A given [`ZeroCopyContext`](struct.ZeroCopyContext.html) can only be used to deserialize a single
+    /// 3. A given [`ZeroCopyContext`](struct.ZeroCopyContext.html) can only be used to decode a single
     /// message before it must be discarded since the read pointer is advanced only when the instance is dropped
     /// (enforced at run time).
     pub fn zero_copy_context(&mut self) -> ZeroCopyContext {
@@ -320,8 +320,8 @@ impl Receiver {
         }
     }
 
-    fn recv_timeout_0<'a, T: Deserialize<'a>>(
-        &'a self,
+    fn recv_timeout_0<T: Decode>(
+        &self,
         timeout: Option<Duration>,
     ) -> Result<Option<(T, u32)>> {
         let mut deadline = None;
@@ -351,10 +351,10 @@ impl Receiver {
     }
 }
 
-/// Borrows a [`Receiver`](struct.Receiver.html) for the purpose of doing zero-copy deserialization of messages
+/// Borrows a [`Receiver`](struct.Receiver.html) for the purpose of doing zero-copy decoding of messages
 /// containing references.
 ///
-/// An instance of this type may only be used to deserialize a single message before it is dropped because the
+/// An instance of this type may only be used to decode a single message before it is dropped because the
 /// [`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html) implementation is what advances the ring buffer
 /// pointer.  Also, the borrowed [`Receiver`](struct.Receiver.html) may not be used directly while it is borrowed
 /// by a [`ZeroCopyContext`](struct.ZeroCopyContext.html).
@@ -371,7 +371,7 @@ impl<'a> ZeroCopyContext<'a> {
     /// This will return `Ok(None)` if there are no messages immediately available.  It will return
     /// `Err(`[`Error::AlreadyReceived`](enum.Error.html#variant.AlreadyReceived)`))` if this instance has already
     /// been used to read a message.
-    pub fn try_recv<'b, T: Deserialize<'b>>(&'b mut self) -> Result<Option<T>> {
+    pub fn try_recv<T: Decode>(&mut self) -> Result<Option<T>> {
         if self.position.is_some() {
             Err(Error::AlreadyReceived)
         } else {
@@ -390,7 +390,7 @@ impl<'a> ZeroCopyContext<'a> {
     ///
     /// This will return `Err(`[`Error::AlreadyReceived`](enum.Error.html#variant.AlreadyReceived)`))` if this
     /// instance has already been used to read a message.
-    pub fn recv<'b, T: Deserialize<'b>>(&'b mut self) -> Result<T> {
+    pub fn recv<T: Decode>(&mut self) -> Result<T> {
         let (value, position) = self.receiver.recv_timeout_0(None)?.unwrap();
 
         self.position = Some(position);
@@ -403,8 +403,8 @@ impl<'a> ZeroCopyContext<'a> {
     ///
     /// This will return `Err(`[`Error::AlreadyReceived`](enum.Error.html#variant.AlreadyReceived)`))` if this
     /// instance has already been used to read a message.
-    pub fn recv_timeout<'b, T: Deserialize<'b>>(
-        &'b mut self,
+    pub fn recv_timeout<T: Decode>(
+        &mut self,
         timeout: Duration,
     ) -> Result<Option<T>> {
         if self.position.is_some() {
@@ -444,11 +444,11 @@ impl Sender {
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
     /// if necessary.
     ///
-    /// The serialized size of the message must be greater than zero or else this method will return
-    /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the serialized size is
+    /// The encoded size of the message must be greater than zero or else this method will return
+    /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the encoded size is
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub fn send(&self, value: &impl Serialize) -> Result<()> {
+    pub fn send(&self, value: &impl Encode) -> Result<()> {
         self.send_timeout_0(value, false, None).map(drop)
     }
 
@@ -457,11 +457,11 @@ impl Sender {
     ///
     /// This will return `Ok(true)` if the message was sent, or `Ok(false)` if it timed out while waiting.
     ///
-    /// The serialized size of the message must be greater than zero or else this method will return
-    /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the serialized size is
+    /// The encoded size of the message must be greater than zero or else this method will return
+    /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the encoded size is
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub fn send_timeout(&self, value: &impl Serialize, timeout: Duration) -> Result<bool> {
+    pub fn send_timeout(&self, value: &impl Encode, timeout: Duration) -> Result<bool> {
         self.send_timeout_0(value, false, Some(timeout))
     }
 
@@ -470,24 +470,25 @@ impl Sender {
     /// This method is appropriate for sending time-sensitive messages where buffering would introduce undesirable
     /// latency.
     ///
-    /// The serialized size of the message must be greater than zero or else this method will return
-    /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the serialized size
+    /// The encoded size of the message must be greater than zero or else this method will return
+    /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the encoded size
     /// is greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub fn send_when_empty(&self, value: &impl Serialize) -> Result<()> {
+    pub fn send_when_empty(&self, value: &impl Encode) -> Result<()> {
         self.send_timeout_0(value, true, None).map(drop)
     }
 
     fn send_timeout_0(
         &self,
-        value: &impl Serialize,
+        value: &impl Encode,
         wait_until_empty: bool,
         timeout: Option<Duration>,
     ) -> Result<bool> {
         let buffer = self.0 .0.buffer();
         let map = self.0 .0.map_mut();
 
-        let size = bincode::serialized_size(value)? as u32;
+        let size = bincode::encoded_size(value, BINCODE_CONFIG)
+            .map_err(|e| Error::Bincode(BincodeError::Encode(e)))? as u32;
 
         if size == 0 {
             return Err(Error::ZeroSizedMessage);
@@ -512,10 +513,11 @@ impl Sender {
                 } else if read != BEGINNING {
                     assert!(write > BEGINNING);
 
-                    bincode::serialize_into(
-                        &mut map[write as usize..(write + 4) as usize],
+                    bincode::encode_into_slice(
                         &0_u32,
-                    )?;
+                        &mut map[write as usize..(write + 4) as usize],
+                        BINCODE_CONFIG,
+                    ).map_err(|e| Error::Bincode(BincodeError::Encode(e)))?;
                     write = BEGINNING;
                     buffer.header().write.store(write, Release);
                     lock.notify_all()?;
@@ -536,10 +538,12 @@ impl Sender {
         }
 
         let start = write + 4;
-        bincode::serialize_into(&mut map[write as usize..start as usize], &size)?;
+        bincode::encode_into_slice(&size, &mut map[write as usize..start as usize], BINCODE_CONFIG)
+            .map_err(|e| Error::Bincode(BincodeError::Encode(e)))?;
 
         let end = start + size;
-        bincode::serialize_into(&mut map[start as usize..end as usize], value)?;
+        bincode::encode_into_slice(value, &mut map[start as usize..end as usize], BINCODE_CONFIG)
+            .map_err(|e| Error::Bincode(BincodeError::Encode(e)))?;
 
         buffer.header().write.store(end, Release);
 
@@ -646,10 +650,9 @@ mod tests {
 
     #[test]
     fn zero_copy() -> Result<()> {
-        #[derive(Serialize, Deserialize, Eq, PartialEq, Debug)]
+        #[derive(Encode, Decode, Eq, PartialEq, Debug)]
         struct Foo<'a> {
             borrowed_str: &'a str,
-            #[serde(with = "serde_bytes")]
             borrowed_bytes: &'a [u8],
         }
 

@@ -2,11 +2,11 @@
 
 extern crate test;
 
-use serde_derive::{Deserialize, Serialize};
+use bincode::{Decode, Encode};
 
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 pub struct YuvFrameInfo {
     pub width: u32,
     pub height: u32,
@@ -15,25 +15,19 @@ pub struct YuvFrameInfo {
     pub v_stride: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct YuvFrame<'a> {
     pub info: YuvFrameInfo,
-    #[serde(with = "serde_bytes")]
     pub y_pixels: &'a [u8],
-    #[serde(with = "serde_bytes")]
     pub u_pixels: &'a [u8],
-    #[serde(with = "serde_bytes")]
     pub v_pixels: &'a [u8],
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct OwnedYuvFrame {
     pub info: YuvFrameInfo,
-    #[serde(with = "serde_bytes")]
     pub y_pixels: Vec<u8>,
-    #[serde(with = "serde_bytes")]
     pub u_pixels: Vec<u8>,
-    #[serde(with = "serde_bytes")]
     pub v_pixels: Vec<u8>,
 }
 
@@ -41,12 +35,14 @@ pub struct OwnedYuvFrame {
 mod tests {
     use super::*;
     use anyhow::{anyhow, Error, Result};
+    use bincode::{config::{Configuration, LittleEndian, Fixint, NoLimit}, Decode, Encode};
     use ipc_channel::ipc;
     use ipmpsc::{Receiver, Sender, SharedRingBuffer};
     use test::Bencher;
 
     const SMALL: (usize, usize) = (3, 2);
     const LARGE: (usize, usize) = (3840, 2160);
+    const BINCODE_CONFIG: Configuration<LittleEndian, Fixint, NoLimit> = bincode::config::legacy();
 
     fn y_stride(width: usize) -> usize {
         width
@@ -236,11 +232,11 @@ mod tests {
                 v_pixels: &v_pixels,
             };
 
-            let size = bincode::serialized_size(&frame).unwrap() as usize;
+            let size = bincode::encoded_size(&frame, BINCODE_CONFIG).unwrap() as usize;
             let mut buffer = vec![0_u8; size];
 
             while exit_rx.try_recv::<u8>()?.is_none() {
-                bincode::serialize_into(&mut buffer as &mut [u8], &frame).unwrap();
+                bincode::encode_into_slice(&frame, &mut buffer as &mut [u8], BINCODE_CONFIG).unwrap();
                 if let Err(e) = tx.send(&buffer) {
                     if exit_rx.try_recv::<u8>()?.is_none() {
                         return Err(Error::from(e));
@@ -259,7 +255,10 @@ mod tests {
         bencher.iter(|| {
             match rx.recv() {
                 Err(e) => panic!("error receiving: {:?}", e),
-                Ok(frame) => test::black_box(bincode::deserialize::<YuvFrame>(&frame).unwrap()),
+                Ok(frame) => {
+                    let (value, _) = bincode::decode_from_slice::<YuvFrame>(&frame, BINCODE_CONFIG).unwrap();
+                    test::black_box(value)
+                },
             };
         });
 

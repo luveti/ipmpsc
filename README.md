@@ -10,8 +10,8 @@ Inter-Process Multiple Producer, Single Consumer Channels for Rust
 
 This library provides a type-safe, high-performance inter-process channel
 implementation based on a shared memory ring buffer.  It uses
-[bincode](https://github.com/TyOverby/bincode) for (de)serialization, including
-zero-copy deserialization, making it ideal for messages with large `&str` or
+[bincode](https://github.com/TyOverby/bincode) for encoding/decoding, including
+zero-copy decoding, making it ideal for messages with large `&str` or
 `&[u8]` fields.  And it has a name that rolls right off the tongue.
 
 ## Examples
@@ -33,8 +33,7 @@ receiver will receive messages from any of them.
 
 ## Performance
 
-`ipmpsc::Receiver::zero_copy_context`, used in combination with
-[serde_bytes](https://github.com/serde-rs/bytes), is capable of supporting very
+`ipmpsc::Receiver::zero_copy_context` is capable of supporting very
 high bandwidth, low latency transfers (e.g. uncompressed video frames).
 
 See the ipc-benchmarks subcrate for a few simple benchmarks that compare
@@ -54,7 +53,7 @@ process with access to that file can read from or write to it depending on its
 privileges.  This may or may not be acceptable depending on the security needs
 of your application and the environment in which it runs.
 
-Note that zero-copy deserialization can provide shared references to the mapped
+Note that zero-copy decoding can provide shared references to the mapped
 file, and internally ipmpsc uses both shared and unique references to segments
 of the file while reading from and writing to the ring buffer.  These references
 are only safe if all processes which access the file obey Rust's memory safety
@@ -72,7 +71,7 @@ https://github.com/dicej/ipmpsc/issues/4 for details.  PRs to fix that are welco
 
 [ipc-channel](https://github.com/servo/ipc-channel) - mature and robust IPC
 channels.  Does not yet support Android, Windows, multiple simultaneous
-senders, or zero-copy deserialization.
+senders, or zero-copy decoding.
 
 [shared_memory](https://github.com/elast0ny/shared_memory-rs) - low-level,
 cross-platform shared memory support.  May be used as the basis for a
